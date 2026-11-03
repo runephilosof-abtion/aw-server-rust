@@ -118,6 +118,21 @@ fn v0140_misplaced_root() -> Option<PathBuf> {
     }
 }
 
+/// `fs::create_dir_all`, but on Unix new directories get mode 0700, as the
+/// XDG Base Directory spec asks: they hold the user's activity history and
+/// config (which can contain the API key). Existing directories are left as is.
+#[cfg(not(target_os = "android"))]
+fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
 /// `<root>/<appname>/<module>` for data/config, creating it.
 ///
 /// On Windows, first recovers anything v0.14.0 wrote to Roaming `%APPDATA%`
@@ -134,7 +149,7 @@ pub fn module_dir(root: PathBuf, appname: &str, module: &str) -> PathBuf {
         }
         None => target,
     };
-    fs::create_dir_all(&dir).expect("Unable to create dir");
+    create_private_dir_all(&dir).expect("Unable to create dir");
     dir
 }
 
@@ -961,7 +976,7 @@ pub fn get_cache_dir() -> Result<PathBuf, ()> {
     #[cfg(not(windows))]
     let root = dirs::cache_dir().ok_or(())?.join(appname());
     let dir = root.join("aw-server-rust");
-    fs::create_dir_all(&dir).expect("Unable to create cache dir");
+    create_private_dir_all(&dir).expect("Unable to create cache dir");
     Ok(dir)
 }
 
@@ -973,7 +988,7 @@ pub fn get_cache_dir() -> Result<PathBuf, ()> {
 #[cfg(not(target_os = "android"))]
 pub fn get_log_dir(module: &str) -> Result<PathBuf, ()> {
     let dir = get_user_log_dir()?.join(module);
-    fs::create_dir_all(&dir).expect("Unable to create log dir");
+    create_private_dir_all(&dir).expect("Unable to create log dir");
     Ok(dir)
 }
 
@@ -2498,4 +2513,25 @@ fn test_default_paths_are_pinned() {
         db_path("default").unwrap(),
         data.join("aw-server-rust").join("sqlite.db")
     );
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+#[test]
+fn test_module_dir_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let dir = module_dir(root.path().to_path_buf(), "activitywatch", "aw-server-rust");
+    for created in [dir.parent().unwrap(), dir.as_path()] {
+        let mode = fs::metadata(created).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "{created:?}");
+    }
+
+    // An existing dir keeps its permissions.
+    let shared = root.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+    let dir = module_dir(root.path().to_path_buf(), "shared", "module");
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&shared), 0o755);
+    assert_eq!(mode(&dir), 0o700);
 }
